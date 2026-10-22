@@ -119,7 +119,10 @@ String smsPhone;
 volatile bool urgentSend    = false;  // ask network task to send telemetry now
 volatile int  smsLastStatus = -1;     // -1 none yet, 0 failed, 1 sent
 
-struct SmsMsg { char text[161]; };
+struct SmsMsg { 
+  char phone[32]; 
+  char text[161]; 
+};
 
 // --------------------------------------------------
 // RELAY HELPERS
@@ -165,11 +168,29 @@ const char* openValveIfSafe() {
 // SMS (SIM800L) - runs in its own task
 // --------------------------------------------------
 
-static void queueSms(const char* text) {
+static void queueSms(const char* phone, const char* text) {
   SmsMsg m;
-  strncpy(m.text, text, sizeof(m.text) - 1);
-  m.text[sizeof(m.text) - 1] = 0;
+  m.phone[0] = 0;
+  m.text[0] = 0;
+
+  if (phone && strlen(phone) > 0) {
+    strncpy(m.phone, phone, sizeof(m.phone) - 1);
+  } else {
+    LOCK();
+    strncpy(m.phone, smsPhone.c_str(), sizeof(m.phone) - 1);
+    UNLOCK();
+  }
+  m.phone[sizeof(m.phone) - 1] = 0;
+
+  if (text) {
+    strncpy(m.text, text, sizeof(m.text) - 1);
+    m.text[sizeof(m.text) - 1] = 0;
+  }
   xQueueSend(smsQueue, &m, 0);
+}
+
+static void queueSms(const char* text) {
+  queueSms(nullptr, text);
 }
 
 static void clearModemInput() {
@@ -195,11 +216,21 @@ static bool modemCmd(const char* cmd, const char* expect, uint32_t timeoutMs) {
   return waitFor(expect, timeoutMs);
 }
 
-static bool sendSmsOnce(const char* text) {
+static bool sendSmsOnce(const char* targetPhone, const char* text) {
   String phone;
-  LOCK();
-  phone = smsPhone;
-  UNLOCK();
+  if (targetPhone && strlen(targetPhone) > 0) {
+    phone = targetPhone;
+  } else {
+    LOCK();
+    phone = smsPhone;
+    UNLOCK();
+  }
+
+  phone.trim();
+  if (phone.startsWith("09")) {
+    phone = "+63" + phone.substring(1);
+  }
+  if (phone.length() < 8) return false;
 
   if (!modemCmd("AT", "OK", 1000))         return false;
   if (!modemCmd("AT+CMGF=1", "OK", 2000))  return false;
@@ -223,13 +254,14 @@ void smsTask(void*) {
   for (;;) {
     if (xQueueReceive(smsQueue, &msg, portMAX_DELAY) == pdTRUE) {
       bool ok = false;
+      Serial.printf("SIM800L dispatching SMS to: %s\n", msg.phone);
       for (int attempt = 1; attempt <= SMS_MAX_ATTEMPTS && !ok; attempt++) {
-        Serial.printf("SMS attempt %d...\n", attempt);
-        ok = sendSmsOnce(msg.text);
+        Serial.printf("SMS attempt %d to %s...\n", attempt, msg.phone);
+        ok = sendSmsOnce(msg.phone, msg.text);
         if (!ok) vTaskDelay(pdMS_TO_TICKS(5000));
       }
       smsLastStatus = ok ? 1 : 0;
-      Serial.println(ok ? "SMS sent." : "SMS FAILED after all attempts.");
+      Serial.println(ok ? "SMS sent successfully." : "SMS FAILED after all attempts.");
     }
   }
 }
@@ -509,15 +541,15 @@ void checkCommands(WiFiClientSecure& client) {
       String msg = doc["command"]["payload"]["message"] | "ALERT: Emergency gas/fire safety alert.";
       String phone = doc["command"]["payload"]["phone"] | "";
       phone.trim();
+      if (phone.startsWith("09")) {
+        phone = "+63" + phone.substring(1);
+      }
       if (phone.length() >= 8) {
-        if (phone.startsWith("09")) {
-          phone = "+63" + phone.substring(1);
-        }
         LOCK();
         smsPhone = phone;
         UNLOCK();
       }
-      queueSms(msg.c_str());
+      queueSms(phone.c_str(), msg.c_str());
       lastStatus = "executed";
       Serial.printf("Command send_sms queued for: %s\n", phone.c_str());
     } else {
@@ -643,7 +675,7 @@ void setup() {
   Serial.println("\nGas & Fire Monitor starting...");
 
   stateMux = xSemaphoreCreateMutex();
-  smsQueue = xQueueCreate(3, sizeof(SmsMsg));
+  smsQueue = xQueueCreate(10, sizeof(SmsMsg));
 
   prefs.begin("fireline", false);
   smsPhone = prefs.getString("sms_phone", DEFAULT_SMS_PHONE);

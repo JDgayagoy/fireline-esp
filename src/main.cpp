@@ -19,8 +19,16 @@
  *    after readings have been safe for SAFE_CLEAR_MS.
  *
  * Serial monitor commands (115200 baud):
+ *    resetwifi             erase saved Wi-Fi from flash and launch setup portal
+ *    wifi                  open captive setup portal AP (FireMonitor-Setup)
+ *    status                print network & sensor status
  *    phone=+63XXXXXXXXXX   save the SMS number to flash (survives reboot)
  *    testsms               queue a test SMS
+ *    reboot                restart ESP32
+ *
+ * Hardware button (GPIO 0 / BOOT):
+ *    Hold 3s   -> Open Wi-Fi setup captive portal AP (FireMonitor-Setup)
+ *    Hold 7s+  -> Factory wipe Wi-Fi credentials from ESP32 flash memory
  *
  * Libraries: ArduinoJson 7.x, DHT sensor library (Adafruit) + Adafruit Unified Sensor.
  * Copy secrets.h.example to secrets.h and fill it in (keep secrets.h out of Git).
@@ -39,13 +47,14 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 
-#include "FireApi.h"  // WIFI_SSID, WIFI_PASS, API_BASE_URL, DEFAULT_SMS_PHONE
+#include "FireApi.h"     // WIFI_SSID, WIFI_PASS, API_BASE_URL, DEFAULT_SMS_PHONE
+#include "WifiPortal.h"  // Captive setup portal & Wi-Fi credentials manager
 
 // --------------------------------------------------
 // PINS
 // --------------------------------------------------
-const int PIN_MQ2         = 34;
-const int PIN_DHT         = 4;
+const int PIN_MQ2 = 34;
+const int PIN_DHT = 4;
 const int PIN_RELAY_VALVE = 26;
 #define GSM_RX_PIN 25
 #define GSM_TX_PIN 33
@@ -61,38 +70,40 @@ HardwareSerial sim800(2);
 // VERIFY physically with gas disconnected. CLOSE = valve power cut / valve shut.
 // If your relay board is active-low, swap these two values.
 const int RELAY_CLOSE_LEVEL = HIGH;
-const int RELAY_OPEN_LEVEL  = LOW;
+const int RELAY_OPEN_LEVEL = LOW;
 
 // Defaults; the backend can override both via GET /api/config.
-volatile int   gasAdcDangerThreshold = 963;   // raw ADC (0-4095)
-volatile float tempDangerThreshold   = 60.0;  // deg C
+volatile int gasAdcDangerThreshold = 50;   // raw ADC (0-4095)
+volatile float tempDangerThreshold = 50.0;  // deg C
 
-const float GAS_CLEAR_RATIO    = 0.90f;  // gas danger clears below 90% of threshold
-const float TEMP_CLEAR_DELTA_C = 2.0f;   // temp danger clears 2 C below threshold
+const float GAS_CLEAR_RATIO = 0.90f;    // gas danger clears below 90% of threshold
+const float TEMP_CLEAR_DELTA_C = 2.0f;  // temp danger clears 2 C below threshold
 
-const unsigned long WARMUP_MS         = 180000;   // MQ-2 warm-up (a brand-new MQ-2 needs far longer once)
-const unsigned long SAFE_CLEAR_MS     = 30000;   // safe time required before remote open
-const unsigned long SMS_COOLDOWN_MS   = 300000;  // min gap between SMS messages (5 min)
+const unsigned long WARMUP_MS = 180000;          // MQ-2 warm-up (a brand-new MQ-2 needs far longer once)
+const unsigned long SAFE_CLEAR_MS = 30000;       // safe time required before remote open
+const unsigned long SMS_COOLDOWN_MS = 300000;    // min gap between SMS messages (5 min)
 const unsigned long FAULT_SMS_DELAY_MS = 60000;  // sensor fault must persist this long before an SMS
 
-// Siren/alarm unit: sent on every danger event, ignores SMS cooldown
-const char* SIREN_PHONE = "+639774719787";
-const char* SIREN_CMD   = "1234#ON#";
-
-const int      ADC_SAMPLES   = 10;
-const uint8_t  DHT_MAX_FAILS = 5;     // consecutive failed DHT reads before "sensor fault"
+const int ADC_SAMPLES = 10;
+const uint8_t DHT_MAX_FAILS = 5;  // consecutive failed DHT reads before "sensor fault"
 const unsigned long DHT_INTERVAL_MS = 2000;
 
 const int WDT_TIMEOUT_S = 10;
+
+const bool GAS_ZERO_IS_VALID = true;
 
 // --------------------------------------------------
 // NETWORK / SMS CONFIGURATION
 // --------------------------------------------------
 const unsigned long READING_INTERVAL_MS = 3000;
-const unsigned long CONFIG_INTERVAL_MS  = 60000;
-const unsigned long HTTP_TIMEOUT_MS     = 5000;   // safe: runs in its own task
+const unsigned long CONFIG_INTERVAL_MS = 60000;
+const unsigned long HTTP_TIMEOUT_MS = 5000;  // safe: runs in its own task
 
 const int SMS_MAX_ATTEMPTS = 5;
+
+// Siren/alarm unit: sent on every danger event, ignores SMS cooldown
+const char* SIREN_PHONE = "+639774719787";
+const char* SIREN_CMD   = "1234#ON#";
 
 const char* FIRMWARE_VERSION = "v1.2.0-esp32";
 
@@ -100,32 +111,32 @@ const char* FIRMWARE_VERSION = "v1.2.0-esp32";
 // SHARED STATE (protect with stateMux)
 // --------------------------------------------------
 SemaphoreHandle_t stateMux;
-QueueHandle_t     smsQueue;
-Preferences       prefs;
+QueueHandle_t smsQueue;
+Preferences prefs;
 
-#define LOCK()   xSemaphoreTake(stateMux, portMAX_DELAY)
+#define LOCK() xSemaphoreTake(stateMux, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(stateMux)
 
-bool  isValveClosed   = true;
-int   gasRaw          = 0;
-float temperatureC    = 0.0;
-float humidity        = 0.0;
-bool  gasSensorValid  = false;
-bool  tempSensorValid = false;
-bool  sensorsValid    = false;
-bool  dangerDetected  = false;
-bool  warmingUp       = true;
-bool  gasInDanger     = false;
-bool  tempInDanger    = false;
+bool isValveClosed = true;
+int gasRaw = 0;
+float temperatureC = 0.0;
+float humidity = 0.0;
+bool gasSensorValid = false;
+bool tempSensorValid = false;
+bool sensorsValid = false;
+bool dangerDetected = false;
+bool warmingUp = true;
+bool gasInDanger = false;
+bool tempInDanger = false;
 unsigned long safeSince = 0;
 String smsPhone;
 
-volatile bool urgentSend    = false;  // ask network task to send telemetry now
-volatile int  smsLastStatus = -1;     // -1 none yet, 0 failed, 1 sent
+volatile bool urgentSend = false;  // ask network task to send telemetry now
+volatile int smsLastStatus = -1;   // -1 none yet, 0 failed, 1 sent
 
-struct SmsMsg { 
-  char phone[32]; 
-  char text[161]; 
+struct SmsMsg {
+  char phone[32];
+  char text[161];
 };
 
 // --------------------------------------------------
@@ -152,9 +163,9 @@ const char* openValveIfSafe() {
   const char* err = nullptr;
 
   LOCK();
-  if (warmingUp)                                           err = "sensor warming up";
-  else if (!sensorsValid)                                  err = "sensor fault";
-  else if (dangerDetected)                                 err = "danger active";
+  if (warmingUp) err = "sensor warming up";
+  else if (!sensorsValid) err = "sensor fault";
+  else if (dangerDetected) err = "danger active";
   else if (safeSince == 0 || now - safeSince < SAFE_CLEAR_MS) err = "safe period not completed";
 
   if (!err) {
@@ -164,7 +175,7 @@ const char* openValveIfSafe() {
   UNLOCK();
 
   if (err) Serial.printf("OPEN REFUSED: %s\n", err);
-  else     Serial.println("Valve opened after safety checks.");
+  else Serial.println("Valve opened after safety checks.");
   return err;
 }
 
@@ -236,8 +247,8 @@ static bool sendSmsOnce(const char* targetPhone, const char* text) {
   }
   if (phone.length() < 8) return false;
 
-  if (!modemCmd("AT", "OK", 1000))         return false;
-  if (!modemCmd("AT+CMGF=1", "OK", 2000))  return false;
+  if (!modemCmd("AT", "OK", 1000)) return false;
+  if (!modemCmd("AT+CMGF=1", "OK", 2000)) return false;
 
   clearModemInput();
   sim800.print("AT+CMGS=\"");
@@ -249,7 +260,7 @@ static bool sendSmsOnce(const char* targetPhone, const char* text) {
   }
 
   sim800.print(text);
-  sim800.write(26);  // Ctrl+Z
+  sim800.write(26);                 // Ctrl+Z
   return waitFor("+CMGS:", 30000);  // modem confirms the message was accepted
 }
 
@@ -331,10 +342,10 @@ void evaluateSafety() {
     Serial.println("MQ-2 warm-up complete.");
   }
 
-  static bool dangerAlertSent = false, sirenAlertSent = false, faultSmsSent = false, smsEverSent = false;
+  static bool dangerAlertSent = false, faultSmsSent = false, smsEverSent = false;
   static unsigned long faultSince = 0, lastSmsMs = 0;
 
-  const int   gasThr  = gasAdcDangerThreshold;
+  const int gasThr = gasAdcDangerThreshold;
   const float tempThr = tempDangerThreshold;
 
   bool gasDanger, tempDanger, fault, wasDanger, danger, wasOpen;
@@ -347,26 +358,26 @@ void evaluateSafety() {
   if (!warmDone) {
     gasInDanger = false;
   } else if (gasSensorValid) {
-    if (!gasInDanger && gasRaw >= gasThr)                          gasInDanger = true;
-    else if (gasInDanger && gasRaw < gasThr * GAS_CLEAR_RATIO)     gasInDanger = false;
+    if (!gasInDanger && gasRaw >= gasThr) gasInDanger = true;
+    else if (gasInDanger && gasRaw < gasThr * GAS_CLEAR_RATIO) gasInDanger = false;
   }
 
   // Temperature with hysteresis.
   if (tempSensorValid) {
-    if (!tempInDanger && temperatureC >= tempThr)                  tempInDanger = true;
+    if (!tempInDanger && temperatureC >= tempThr) tempInDanger = true;
     else if (tempInDanger && temperatureC < tempThr - TEMP_CLEAR_DELTA_C) tempInDanger = false;
   }
 
-  gasDanger  = gasInDanger;
+  gasDanger = gasInDanger;
   tempDanger = tempInDanger;
-  fault      = warmDone && !sensorsValid;
+  fault = warmDone && !sensorsValid;
 
-  wasDanger      = dangerDetected;
+  wasDanger = dangerDetected;
   dangerDetected = gasDanger || tempDanger || fault;
-  danger         = dangerDetected;
+  danger = dangerDetected;
 
   if (!warmDone || dangerDetected) safeSince = 0;
-  else if (safeSince == 0)         safeSince = now;
+  else if (safeSince == 0) safeSince = now;
   safeSinceCopy = safeSince;
 
   // 1) RELAY FIRST: shut the valve (also held closed during warm-up).
@@ -376,34 +387,30 @@ void evaluateSafety() {
 
   if (wasOpen && danger) {
     Serial.printf("SHUTOFF: %s\n", fault ? "Sensor fault: fail-safe shutdown"
-                                        : "Gas or temperature danger detected");
+                                         : "Gas or temperature danger detected");
   }
 
-  // Send telemetry right away instead of waiting for the next 3s slot.
-  if (danger && !wasDanger) urgentSend = true;
-
+  // Danger just started: telemetry now + siren ON (queued before the alert SMS).
+  if (danger && !wasDanger) {
+    urgentSend = true;
+    queueSms(SIREN_PHONE, SIREN_CMD);
+  }
   // 2) SMS (queued; sent by smsTask without blocking this loop).
-  auto smsAllowed = [&]() { return !smsEverSent || (now - lastSmsMs) >= SMS_COOLDOWN_MS; };
+  auto smsAllowed = [&]() {
+    return !smsEverSent || (now - lastSmsMs) >= SMS_COOLDOWN_MS;
+  };
 
   if (gasDanger || tempDanger) {
-    // Siren/alarm unit: sent on every danger event, ignores SMS cooldown
-    if (!sirenAlertSent) {
-      queueSms(SIREN_PHONE, SIREN_CMD);
-      sirenAlertSent = true;
-      Serial.printf("Siren alarm trigger sent to %s: %s\n", SIREN_PHONE, SIREN_CMD);
-    }
-
     if (!dangerAlertSent && smsAllowed()) {
       queueSms(gasDanger
-        ? "ALERT: Gas/smoke detected. LPG valve has been shut off. Check the site safely."
-        : "ALERT: High temperature detected. LPG valve has been shut off. Check the site safely.");
+                 ? "ALERT: Gas/smoke detected. LPG valve has been shut off. Check the site safely."
+                 : "ALERT: High temperature detected. LPG valve has been shut off. Check the site safely.");
       dangerAlertSent = true;
       smsEverSent = true;
       lastSmsMs = now;
     }
   } else if (!danger && safeSinceCopy != 0 && (now - safeSinceCopy) >= SAFE_CLEAR_MS) {
     dangerAlertSent = false;  // re-arm after stable safe readings
-    sirenAlertSent  = false;  // re-arm siren unit
   }
 
   // Sensor fault: valve already closed; only text if it persists.
@@ -427,7 +434,7 @@ void evaluateSafety() {
 
 // GET when payload is empty, otherwise POST JSON. Returns HTTP code or -1.
 static int httpRequest(WiFiClientSecure& client, const String& path,
-                      const String& payload, String* response) {
+                       const String& payload, String* response) {
   HTTPClient http;
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.setTimeout(HTTP_TIMEOUT_MS);
@@ -479,33 +486,39 @@ void syncConfig(WiFiClientSecure& client) {
 // --------------------------------------------------
 
 void sendReadings(WiFiClientSecure& client) {
-  int   gas;
+  int gas;
   float temp, hum;
-  bool  gasValid, tempValid, danger, valveClosed, warming;
+  bool gasValid, tempValid, danger, valveClosed, warming;
 
   LOCK();
-  gas = gasRaw; temp = temperatureC; hum = humidity;
-  gasValid = gasSensorValid; tempValid = tempSensorValid;
-  danger = dangerDetected; valveClosed = isValveClosed; warming = warmingUp;
+  gas = gasRaw;
+  temp = temperatureC;
+  hum = humidity;
+  gasValid = gasSensorValid;
+  tempValid = tempSensorValid;
+  danger = dangerDetected;
+  valveClosed = isValveClosed;
+  warming = warmingUp;
   UNLOCK();
 
   const int s = smsLastStatus;
 
   JsonDocument doc;
-  doc["gas"]               = gas;            // raw ADC, NOT PPM
-  doc["gas_adc"]           = gas;
-  doc["smoke"]             = gas / 10.0;     // derived from the same MQ-2
-  doc["temperature"]       = temp;
-  doc["humidity"]          = hum;
-  doc["gas_sensor_valid"]  = gasValid;
+  doc["gas"] = gas;  // raw ADC, NOT PPM
+  doc["gas_adc"] = gas;
+  doc["smoke"] = gas / 10.0;  // derived from the same MQ-2
+  doc["temperature"] = temp;
+  doc["humidity"] = hum;
+  doc["gas_sensor_valid"] = gasValid;
   doc["temp_sensor_valid"] = tempValid;
-  doc["danger_detected"]   = danger;
-  doc["valve_closed"]      = valveClosed;
-  doc["warming_up"]        = warming;
-  doc["sms_last_status"]   = (s == 1) ? "sent" : (s == 0) ? "failed" : "none";
-  doc["rssi"]              = WiFi.RSSI();
-  doc["uptime"]            = millis() / 1000;
-  doc["firmware_version"]  = FIRMWARE_VERSION;
+  doc["danger_detected"] = danger;
+  doc["valve_closed"] = valveClosed;
+  doc["warming_up"] = warming;
+  doc["sms_last_status"] = (s == 1) ? "sent" : (s == 0) ? "failed"
+                                                        : "none";
+  doc["rssi"] = WiFi.RSSI();
+  doc["uptime"] = millis() / 1000;
+  doc["firmware_version"] = FIRMWARE_VERSION;
 
   String body;
   serializeJson(doc, body);
@@ -526,7 +539,7 @@ void checkCommands(WiFiClientSecure& client) {
   if (deserializeJson(doc, body)) return;
   if (doc["command"].isNull()) return;
 
-  String id   = doc["command"]["id"]      | "";
+  String id = doc["command"]["id"] | "";
   String name = doc["command"]["command"] | "";
   if (id.isEmpty()) return;
 
@@ -560,6 +573,27 @@ void checkCommands(WiFiClientSecure& client) {
       queueSms(target, msg.c_str());
       lastStatus = "executed";
       Serial.printf("Command send_sms queued for: %s\n", target ? target : "default");
+    } else if (name == "reset_wifi") {
+      lastStatus = "executed";
+      Serial.println("Remote Wi-Fi reset command received.");
+      wipeWifiRequested = true;
+    } else if (name == "start_portal") {
+      lastStatus = "executed";
+      Serial.println("Remote start setup portal command received.");
+      portalRequested = true;
+    } else if (name == "calibrate_sensor") {
+      lastStatus = "executed";
+      Serial.println("Command calibrate_sensor acknowledged.");
+    } else if (name == "reboot_device") {
+      lastStatus = "executed";
+      Serial.println("Reboot command received. Restarting ESP32...");
+      JsonDocument res;
+      res["status"] = "executed";
+      String resBody;
+      serializeJson(res, resBody);
+      httpRequest(client, "/commands/" + lastId + "/result", resBody, nullptr);
+      delay(1000);
+      ESP.restart();
     } else {
       lastStatus = "rejected";
       lastError = "unsupported command";
@@ -580,26 +614,19 @@ void checkCommands(WiFiClientSecure& client) {
 // --------------------------------------------------
 
 void networkTask(void*) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiMgrBegin();
 
   WiFiClientSecure client;
   client.setInsecure();  // prototype: skips certificate validation
 
-  unsigned long lastReading = 0, lastConfig = 0, lastWifiTry = millis();
+  unsigned long lastReading = 0, lastConfig = 0;
   bool firstConfig = true;
 
   for (;;) {
     const unsigned long now = millis();
 
-    if (WiFi.status() != WL_CONNECTED) {
-      if (now - lastWifiTry >= 10000) {
-        lastWifiTry = now;
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
-      }
-      vTaskDelay(pdMS_TO_TICKS(500));
+    if (!wifiMgrService(now)) {
+      vTaskDelay(pdMS_TO_TICKS(wifiPortalActive() ? 10 : 500));
       continue;
     }
 
@@ -616,7 +643,7 @@ void networkTask(void*) {
       checkCommands(client);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(wifiPortalActive() ? 10 : 100));
   }
 }
 
@@ -647,10 +674,62 @@ void handleSerial() {
         Serial.println("Test SMS queued.");
       } else if (line == "testsiren") {
         queueSms(SIREN_PHONE, SIREN_CMD);
-        Serial.printf("Test Siren SMS queued to %s: %s\n", SIREN_PHONE, SIREN_CMD);
+        Serial.println("Siren ON SMS queued.");
+      } else if (line == "sirenoff") {
+        queueSms(SIREN_PHONE, "1234#OFF#");
+        Serial.println("Siren OFF SMS queued.");
+      } else if (line.equalsIgnoreCase("resetwifi") || line.equalsIgnoreCase("wifi_reset") || line.equalsIgnoreCase("reset_wifi")) {
+        Serial.println(F("\n[SERIAL] Resetting Wi-Fi credentials and launching setup portal..."));
+        wipeWifiRequested = true;
+      } else if (line.equalsIgnoreCase("wifi") || line.equalsIgnoreCase("portal")) {
+        Serial.println(F("\n[SERIAL] Starting Wi-Fi captive setup portal (AP: FireMonitor-Setup)..."));
+        portalRequested = true;
+      } else if (line.equalsIgnoreCase("status")) {
+        Serial.println(F("\n=== DEVICE HARDWARE & NETWORK STATUS ==="));
+        LOCK();
+        Serial.printf("Sensors: Gas ADC %d | Temp %.1f C | Hum %.1f %% | Danger: %s | Valve: %s\n",
+                      gasRaw, temperatureC, humidity,
+                      dangerDetected ? "ACTIVE DANGER" : "Safe",
+                      isValveClosed ? "CLOSED" : "OPEN");
+        UNLOCK();
+        Serial.printf("Wi-Fi: %s | SSID: '%s' | IP: %s | RSSI: %d dBm\n",
+                      WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE",
+                      WiFi.SSID().c_str(),
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.RSSI());
+        Serial.printf("Setup Portal AP: %s (SSID: FireMonitor-Setup @ 192.168.4.1)\n",
+                      wifiPortalActive() ? "ACTIVE" : "OFF");
+        Serial.println(F("========================================"));
+      } else if (line.equalsIgnoreCase("reboot")) {
+        Serial.println(F("Rebooting ESP32..."));
+        delay(500);
+        ESP.restart();
+      } else if (line.startsWith("setwifi=")) {
+        String args = line.substring(8);
+        args.trim();
+        int commaIdx = args.indexOf(',');
+        if (commaIdx > 0) {
+          String newSsid = args.substring(0, commaIdx);
+          String newPass = args.substring(commaIdx + 1);
+          newSsid.trim();
+          newPass.trim();
+          wifiMgrSetCreds(newSsid, newPass);
+        } else {
+          Serial.println(F("Usage: setwifi=SSID,PASSWORD (or setwifi=SSID, if open)"));
+        }
+      } else if (line.equalsIgnoreCase("help") || line == "?") {
+        Serial.println(F("\n--- Available Serial Commands ---"));
+        Serial.println(F("  setwifi=SSID,PASS: Save Wi-Fi & password directly"));
+        Serial.println(F("  resetwifi        : Erase saved Wi-Fi from flash and launch setup portal"));
+        Serial.println(F("  wifi             : Open setup captive portal (FireMonitor-Setup)"));
+        Serial.println(F("  status           : Print full hardware & network status"));
+        Serial.println(F("  phone=+63...     : Save emergency SMS destination phone"));
+        Serial.println(F("  testsms          : Trigger test emergency SMS dispatch"));
+        Serial.println(F("  reboot           : Restart ESP32"));
+        Serial.println(F("---------------------------------"));
       }
       line = "";
-    } else if (line.length() < 40) {
+    } else if (line.length() < 96) {
       line += c;
     }
   }
@@ -700,9 +779,9 @@ void setup() {
   // Watchdog on the safety loop: a hang causes a reset (valve boots closed).
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t wdtCfg = {
-    .timeout_ms     = WDT_TIMEOUT_S * 1000,
+    .timeout_ms = WDT_TIMEOUT_S * 1000,
     .idle_core_mask = 0,
-    .trigger_panic  = true
+    .trigger_panic = true
   };
   if (esp_task_wdt_init(&wdtCfg) == ESP_ERR_INVALID_STATE) {
     esp_task_wdt_reconfigure(&wdtCfg);
@@ -712,7 +791,7 @@ void setup() {
 #endif
   esp_task_wdt_add(NULL);
 
-  xTaskCreatePinnedToCore(smsTask,     "sms", 4096,  NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(smsTask, "sms", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(networkTask, "net", 16384, NULL, 1, NULL, 0);
 
   Serial.println("Local monitoring active. Valve stays closed until a safe remote open.");

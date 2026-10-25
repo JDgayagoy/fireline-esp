@@ -556,14 +556,10 @@ void checkCommands(WiFiClientSecure& client) {
       if (phone.startsWith("09")) {
         phone = "+63" + phone.substring(1);
       }
-      if (phone.length() >= 8) {
-        LOCK();
-        smsPhone = phone;
-        UNLOCK();
-      }
-      queueSms(phone.c_str(), msg.c_str());
+      const char* target = (phone.length() >= 8) ? phone.c_str() : nullptr;
+      queueSms(target, msg.c_str());
       lastStatus = "executed";
-      Serial.printf("Command send_sms queued for: %s\n", phone.c_str());
+      Serial.printf("Command send_sms queued for: %s\n", target ? target : "default");
     } else {
       lastStatus = "rejected";
       lastError = "unsupported command";

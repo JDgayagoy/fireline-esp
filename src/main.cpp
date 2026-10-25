@@ -75,6 +75,10 @@ const unsigned long SAFE_CLEAR_MS     = 30000;   // safe time required before re
 const unsigned long SMS_COOLDOWN_MS   = 300000;  // min gap between SMS messages (5 min)
 const unsigned long FAULT_SMS_DELAY_MS = 60000;  // sensor fault must persist this long before an SMS
 
+// Siren/alarm unit: sent on every danger event, ignores SMS cooldown
+const char* SIREN_PHONE = "+639774719787";
+const char* SIREN_CMD   = "1234#ON#";
+
 const int      ADC_SAMPLES   = 10;
 const uint8_t  DHT_MAX_FAILS = 5;     // consecutive failed DHT reads before "sensor fault"
 const unsigned long DHT_INTERVAL_MS = 2000;
@@ -327,7 +331,7 @@ void evaluateSafety() {
     Serial.println("MQ-2 warm-up complete.");
   }
 
-  static bool dangerAlertSent = false, faultSmsSent = false, smsEverSent = false;
+  static bool dangerAlertSent = false, sirenAlertSent = false, faultSmsSent = false, smsEverSent = false;
   static unsigned long faultSince = 0, lastSmsMs = 0;
 
   const int   gasThr  = gasAdcDangerThreshold;
@@ -382,6 +386,13 @@ void evaluateSafety() {
   auto smsAllowed = [&]() { return !smsEverSent || (now - lastSmsMs) >= SMS_COOLDOWN_MS; };
 
   if (gasDanger || tempDanger) {
+    // Siren/alarm unit: sent on every danger event, ignores SMS cooldown
+    if (!sirenAlertSent) {
+      queueSms(SIREN_PHONE, SIREN_CMD);
+      sirenAlertSent = true;
+      Serial.printf("Siren alarm trigger sent to %s: %s\n", SIREN_PHONE, SIREN_CMD);
+    }
+
     if (!dangerAlertSent && smsAllowed()) {
       queueSms(gasDanger
         ? "ALERT: Gas/smoke detected. LPG valve has been shut off. Check the site safely."
@@ -392,6 +403,7 @@ void evaluateSafety() {
     }
   } else if (!danger && safeSinceCopy != 0 && (now - safeSinceCopy) >= SAFE_CLEAR_MS) {
     dangerAlertSent = false;  // re-arm after stable safe readings
+    sirenAlertSent  = false;  // re-arm siren unit
   }
 
   // Sensor fault: valve already closed; only text if it persists.
@@ -637,6 +649,9 @@ void handleSerial() {
       } else if (line == "testsms") {
         queueSms("TEST: Gas monitor SMS check.");
         Serial.println("Test SMS queued.");
+      } else if (line == "testsiren") {
+        queueSms(SIREN_PHONE, SIREN_CMD);
+        Serial.printf("Test Siren SMS queued to %s: %s\n", SIREN_PHONE, SIREN_CMD);
       }
       line = "";
     } else if (line.length() < 40) {

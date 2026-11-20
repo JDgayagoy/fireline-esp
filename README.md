@@ -203,3 +203,4 @@ firmware/
     ├── WifiPortal.h     # Captive Wi-Fi setup portal & NVS credential manager
     └── FireApi.h        # Default Wi-Fi SSID/password, API URL, and SMS phone
 ```
+

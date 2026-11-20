@@ -1,42 +1,38 @@
 /**
- * Gas & Fire Monitor - ESP32 Firmware v1.2.0
+- Gas & Fire Monitor - ESP32 Firmware v1.2.4
  *
- * Hardware:
- *  - ESP32 NodeMCU
- *  - MQ-2 analog output : GPIO 34 (input-only pin)
- *  - DHT11 data         : GPIO 4
- *  - Relay (valve)      : GPIO 26
- *  - SIM800L            : ESP32 RX=25 (to SIM800L TX), ESP32 TX=33 (to SIM800L RX)
+- Hardware:
+-  - ESP32 NodeMCU
+-  - MQ-2 analog output : GPIO 34 (input-only pin)
+-  - DHT11 data         : GPIO 4
+-  - Relay (valve)      : GPIO 26 (low-level trigger)
+-  - SIM800L            : ESP32 RX=25 (to SIM800L TX), ESP32 TX=33 (to SIM800L RX)
  *
- * Behaviour:
- *  - On gas/smoke/temperature danger: relay shuts the valve FIRST, then one SMS
- *    is queued. SMS is sent by the SIM800L directly (no API / Wi-Fi needed).
- *  - Safety loop (sensors + relay) never waits on Wi-Fi, HTTPS or SMS:
- *      loop()      -> sensors + safety logic          (core 1)
- *      networkTask -> telemetry, commands, config     (core 0)
- *      smsTask     -> SIM800L SMS with retry          (core 0)
- *  - Valve never reopens automatically. A remote open_valve is only accepted
- *    after readings have been safe for SAFE_CLEAR_MS.
+- Behaviour:
+-  - On gas/smoke/temperature danger: relay shuts the valve FIRST, then one SMS
+-    is queued. SMS is sent by the SIM800L directly (no API / Wi-Fi needed).
+-  - Safety loop (sensors + relay) never waits on Wi-Fi, HTTPS or SMS:
+-      loop()      -> sensors + safety logic          (core 1)
+-      networkTask -> telemetry, commands, config     (core 0)
+-      smsTask     -> SIM800L SMS with retry          (core 0)
  *
- * Serial monitor commands (115200 baud):
- *    resetwifi             erase saved Wi-Fi from flash and launch setup portal
- *    wifi                  open captive setup portal AP (FireMonitor-Setup)
- *    status                print network & sensor status
- *    phone=+63XXXXXXXXXX   save the SMS number to flash (survives reboot)
- *    testsms               queue a test SMS
- *    reboot                restart ESP32
+- Serial monitor commands (115200 baud):
+-    openvalve             try opening valve (respects warm-up, danger, SAFE_CLEAR_MS)
+-    closevalve            immediately close valve
+-    resetwifi             erase saved Wi-Fi from flash and launch setup portal
+-    wifi                  open captive setup portal AP (FireMonitor-Setup)
+-    status                print network & sensor status
+-    phone=+63XXXXXXXXXX   save the SMS number to flash (survives reboot)
+-    testsms               queue a test SMS
+-    reboot                restart ESP32
  *
- * Hardware button (GPIO 0 / BOOT):
- *    Hold 3s   -> Open Wi-Fi setup captive portal AP (FireMonitor-Setup)
- *    Hold 7s+  -> Factory wipe Wi-Fi credentials from ESP32 flash memory
+- Libraries: ArduinoJson 7.x, DHT sensor library (Adafruit) + Adafruit Unified Sensor.
+- Copy secrets.h.example to secrets.h and fill it in (keep secrets.h out of Git).
  *
- * Libraries: ArduinoJson 7.x, DHT sensor library (Adafruit) + Adafruit Unified Sensor.
- * Copy secrets.h.example to secrets.h and fill it in (keep secrets.h out of Git).
- *
- * IMPORTANT:
- *  - Verify relay polarity with the gas line DISCONNECTED (see RELAY_*_LEVEL).
- *  - Gas threshold is a raw ADC value, NOT PPM. Calibrate the MQ-2.
- *  - This is not certified safety equipment.
+- IMPORTANT:
+-  - Verify relay polarity with the gas line DISCONNECTED (see RELAY_ACTIVE_LOW).
+-  - Gas threshold is a raw ADC value, NOT PPM. Calibrate the MQ-2.
+-  - This is not certified safety equipment.
  */
 
 #include <WiFi.h>
@@ -67,10 +63,19 @@ HardwareSerial sim800(2);
 // SAFETY CONFIGURATION
 // --------------------------------------------------
 
-// VERIFY physically with gas disconnected. CLOSE = valve power cut / valve shut.
-// If your relay board is active-low, swap these two values.
-const int RELAY_CLOSE_LEVEL = HIGH;
-const int RELAY_OPEN_LEVEL = LOW;
+// Low-level trigger relay: LOW activates/closes, HIGH de-energizes/opens.
+// VERIFY physically with gas disconnected so "valve closed" matches your wiring.
+const bool RELAY_ACTIVE_LOW = true;
+const int RELAY_CLOSE_LEVEL = RELAY_ACTIVE_LOW ? LOW : HIGH;
+const int RELAY_OPEN_LEVEL  = RELAY_ACTIVE_LOW ? HIGH : LOW;
+
+// Set to true for strict fail-safe shutdown on sensor faults; false to avoid
+// locking Danger=YES when a sensor read fails during testing/wiring checks.
+const bool FAIL_SAFE_ON_SENSOR_FAULT = true;
+
+// Set to true to automatically open the valve after warm-up + SAFE_CLEAR_MS when safe.
+// Set to false if you only want remote open_valve or Serial "openvalve" to open it.
+const bool AUTO_OPEN_WHEN_SAFE = false;
 
 // Defaults; the backend can override both via GET /api/config.
 volatile int gasAdcDangerThreshold = 50;   // raw ADC (0-4095)
@@ -79,9 +84,9 @@ volatile float tempDangerThreshold = 50.0;  // deg C
 const float GAS_CLEAR_RATIO = 0.90f;    // gas danger clears below 90% of threshold
 const float TEMP_CLEAR_DELTA_C = 2.0f;  // temp danger clears 2 C below threshold
 
-const unsigned long WARMUP_MS = 180000;          // MQ-2 warm-up (a brand-new MQ-2 needs far longer once)
-const unsigned long SAFE_CLEAR_MS = 30000;       // safe time required before remote open
-const unsigned long SMS_COOLDOWN_MS = 300000;    // min gap between SMS messages (5 min)
+const unsigned long WARMUP_MS = 60000;          // MQ-2 warm-up (a brand-new MQ-2 needs far longer once)
+const unsigned long SAFE_CLEAR_MS = 30000;       // safe time required before opening
+const unsigned long SMS_COOLDOWN_MS = 60000;    // min gap between SMS messages (1 min)
 const unsigned long FAULT_SMS_DELAY_MS = 60000;  // sensor fault must persist this long before an SMS
 
 const int ADC_SAMPLES = 10;
@@ -90,7 +95,7 @@ const unsigned long DHT_INTERVAL_MS = 2000;
 
 const int WDT_TIMEOUT_S = 10;
 
-const bool GAS_ZERO_IS_VALID = true;
+const bool GAS_ZERO_IS_VALID = false;
 
 // --------------------------------------------------
 // NETWORK / SMS CONFIGURATION
@@ -102,10 +107,10 @@ const unsigned long HTTP_TIMEOUT_MS = 5000;  // safe: runs in its own task
 const int SMS_MAX_ATTEMPTS = 5;
 
 // Siren/alarm unit: sent on every danger event, ignores SMS cooldown
-const char* SIREN_PHONE = "+639774719787";
+const char* SIREN_PHONE = "+639661899935";
 const char* SIREN_CMD   = "1234#ON#";
 
-const char* FIRMWARE_VERSION = "v1.2.0-esp32";
+const char* FIRMWARE_VERSION = "v1.2.4-esp32";
 
 // --------------------------------------------------
 // SHARED STATE (protect with stateMux)
@@ -164,7 +169,7 @@ const char* openValveIfSafe() {
 
   LOCK();
   if (warmingUp) err = "sensor warming up";
-  else if (!sensorsValid) err = "sensor fault";
+  else if (FAIL_SAFE_ON_SENSOR_FAULT && !sensorsValid) err = "sensor fault";
   else if (dangerDetected) err = "danger active";
   else if (safeSince == 0 || now - safeSince < SAFE_CLEAR_MS) err = "safe period not completed";
 
@@ -277,6 +282,8 @@ void smsTask(void*) {
       }
       smsLastStatus = ok ? 1 : 0;
       Serial.println(ok ? "SMS sent successfully." : "SMS FAILED after all attempts.");
+      // Allow 3s between successive SMS dispatches to let SIM800L radio & power recover
+      vTaskDelay(pdMS_TO_TICKS(3000));
     }
   }
 }
@@ -286,7 +293,6 @@ void smsTask(void*) {
 // --------------------------------------------------
 
 void readSensors() {
-  // Average several samples to reduce ADC noise.
   long sum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++) {
     sum += analogRead(PIN_MQ2);
@@ -294,7 +300,6 @@ void readSensors() {
   }
   const int raw = sum / ADC_SAMPLES;
 
-  // DHT11 is slow; read it every few seconds and debounce failures.
   static unsigned long lastDht = 0;
   static uint8_t dhtFails = 0;
   bool dhtRead = false, dhtOk = false;
@@ -311,9 +316,7 @@ void readSensors() {
 
   LOCK();
   gasRaw = raw;
-  // Disconnected / shorted-to-ground check. A saturated ADC (~4095) is NOT a
-  // fault: it is treated as extreme gas and trips the danger threshold.
-  gasSensorValid = (raw > 5);
+  gasSensorValid = GAS_ZERO_IS_VALID ? (raw >= 0) : (raw > 5);
 
   if (dhtRead) {
     if (dhtOk) {
@@ -348,21 +351,23 @@ void evaluateSafety() {
   const int gasThr = gasAdcDangerThreshold;
   const float tempThr = tempDangerThreshold;
 
-  bool gasDanger, tempDanger, fault, wasDanger, danger, wasOpen;
+  bool gasDanger, tempDanger, fault, wasDanger, danger, wasOpen, gasTripEvent, valveClosedSnapshot;
+  int gasSnapshot;
   unsigned long safeSinceCopy;
 
   LOCK();
   warmingUp = !warmDone;
+  gasSnapshot = gasRaw;
 
-  // Gas with hysteresis (ignored during warm-up).
+  bool prevGasInDanger = gasInDanger;
   if (!warmDone) {
     gasInDanger = false;
   } else if (gasSensorValid) {
     if (!gasInDanger && gasRaw >= gasThr) gasInDanger = true;
     else if (gasInDanger && gasRaw < gasThr * GAS_CLEAR_RATIO) gasInDanger = false;
   }
+  gasTripEvent = (!prevGasInDanger && gasInDanger);
 
-  // Temperature with hysteresis.
   if (tempSensorValid) {
     if (!tempInDanger && temperatureC >= tempThr) tempInDanger = true;
     else if (tempInDanger && temperatureC < tempThr - TEMP_CLEAR_DELTA_C) tempInDanger = false;
@@ -373,33 +378,38 @@ void evaluateSafety() {
   fault = warmDone && !sensorsValid;
 
   wasDanger = dangerDetected;
-  dangerDetected = gasDanger || tempDanger || fault;
+  dangerDetected = gasDanger || tempDanger || (FAIL_SAFE_ON_SENSOR_FAULT && fault);
   danger = dangerDetected;
 
   if (!warmDone || dangerDetected) safeSince = 0;
   else if (safeSince == 0) safeSince = now;
   safeSinceCopy = safeSince;
 
-  // 1) RELAY FIRST: shut the valve (also held closed during warm-up).
   wasOpen = !isValveClosed;
   if (!warmDone || dangerDetected) relayClose();
+  valveClosedSnapshot = isValveClosed;
   UNLOCK();
+
+  if (AUTO_OPEN_WHEN_SAFE && warmDone && !danger && valveClosedSnapshot &&
+      safeSinceCopy != 0 && (now - safeSinceCopy) >= SAFE_CLEAR_MS) {
+    openValveIfSafe();
+  }
+
+  if (gasTripEvent) {
+    Serial.printf("MQ-2 HIGH (ADC %d >= %d): relay set to close level (%s).\n",
+                  gasSnapshot, gasThr, RELAY_CLOSE_LEVEL == HIGH ? "HIGH" : "LOW");
+  }
 
   if (wasOpen && danger) {
     Serial.printf("SHUTOFF: %s\n", fault ? "Sensor fault: fail-safe shutdown"
                                          : "Gas or temperature danger detected");
   }
 
-  // Danger just started: telemetry now + siren ON (queued before the alert SMS).
-  if (danger && !wasDanger) {
-    urgentSend = true;
-    queueSms(SIREN_PHONE, SIREN_CMD);
-  }
-  // 2) SMS (queued; sent by smsTask without blocking this loop).
   auto smsAllowed = [&]() {
     return !smsEverSent || (now - lastSmsMs) >= SMS_COOLDOWN_MS;
   };
 
+  // 1) PRIMARY CONTACT ALERT FIRST: Always queue emergency text to homeowner before siren
   if (gasDanger || tempDanger) {
     if (!dangerAlertSent && smsAllowed()) {
       queueSms(gasDanger
@@ -410,11 +420,16 @@ void evaluateSafety() {
       lastSmsMs = now;
     }
   } else if (!danger && safeSinceCopy != 0 && (now - safeSinceCopy) >= SAFE_CLEAR_MS) {
-    dangerAlertSent = false;  // re-arm after stable safe readings
+    dangerAlertSent = false;
   }
 
-  // Sensor fault: valve already closed; only text if it persists.
-  if (fault) {
+  // 2) SIREN SECOND: Queue siren activation only after primary alert has been queued
+  if (danger && !wasDanger) {
+    urgentSend = true;
+    queueSms(SIREN_PHONE, SIREN_CMD);
+  }
+
+  if (FAIL_SAFE_ON_SENSOR_FAULT && fault) {
     if (faultSince == 0) faultSince = now;
     if (!faultSmsSent && (now - faultSince) >= FAULT_SMS_DELAY_MS && smsAllowed()) {
       queueSms("WARNING: Sensor fault on gas monitor. LPG valve shut off as a precaution.");
@@ -432,7 +447,6 @@ void evaluateSafety() {
 // HTTPS HELPERS (network task only)
 // --------------------------------------------------
 
-// GET when payload is empty, otherwise POST JSON. Returns HTTP code or -1.
 static int httpRequest(WiFiClientSecure& client, const String& path,
                        const String& payload, String* response) {
   HTTPClient http;
@@ -476,6 +490,16 @@ void syncConfig(WiFiClientSecure& client) {
     float thr = doc["temp_danger_threshold"].as<float>();
     if (thr > 0 && thr <= 150) tempDangerThreshold = thr;
   }
+  if (!doc["primary_phone"].isNull()) {
+    String p = doc["primary_phone"].as<String>();
+    p.trim();
+    if (p.length() >= 8 && p.startsWith("+")) {
+      LOCK();
+      smsPhone = p;
+      UNLOCK();
+      prefs.putString("sms_phone", p);
+    }
+  }
 
   Serial.printf("Config: gas ADC >= %d, temperature >= %.1f C\n",
                 (int)gasAdcDangerThreshold, (float)tempDangerThreshold);
@@ -504,9 +528,9 @@ void sendReadings(WiFiClientSecure& client) {
   const int s = smsLastStatus;
 
   JsonDocument doc;
-  doc["gas"] = gas;  // raw ADC, NOT PPM
+  doc["gas"] = gas;
   doc["gas_adc"] = gas;
-  doc["smoke"] = gas / 10.0;  // derived from the same MQ-2
+  doc["smoke"] = gas / 10.0;
   doc["temperature"] = temp;
   doc["humidity"] = hum;
   doc["gas_sensor_valid"] = gasValid;
@@ -543,8 +567,6 @@ void checkCommands(WiFiClientSecure& client) {
   String name = doc["command"]["command"] | "";
   if (id.isEmpty()) return;
 
-  // Remember the last result so a failed report can be re-sent
-  // without executing the command twice.
   static String lastId, lastStatus, lastError;
 
   if (id != lastId) {
@@ -617,7 +639,7 @@ void networkTask(void*) {
   wifiMgrBegin();
 
   WiFiClientSecure client;
-  client.setInsecure();  // prototype: skips certificate validation
+  client.setInsecure();
 
   unsigned long lastReading = 0, lastConfig = 0;
   bool firstConfig = true;
@@ -657,7 +679,11 @@ void handleSerial() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       line.trim();
-      if (line.startsWith("phone=")) {
+      if (line.equalsIgnoreCase("openvalve") || line.equalsIgnoreCase("open_valve")) {
+        openValveIfSafe();
+      } else if (line.equalsIgnoreCase("closevalve") || line.equalsIgnoreCase("close_valve")) {
+        closeValveLocal("Serial close command");
+      } else if (line.startsWith("phone=")) {
         String p = line.substring(6);
         p.trim();
         if (p.length() >= 8 && p.length() <= 16 && p[0] == '+') {
@@ -687,8 +713,10 @@ void handleSerial() {
       } else if (line.equalsIgnoreCase("status")) {
         Serial.println(F("\n=== DEVICE HARDWARE & NETWORK STATUS ==="));
         LOCK();
-        Serial.printf("Sensors: Gas ADC %d | Temp %.1f C | Hum %.1f %% | Danger: %s | Valve: %s\n",
-                      gasRaw, temperatureC, humidity,
+        Serial.printf("Sensors: Gas ADC %d (GasOK:%d) | Temp %.1f C (TempOK:%d) | Hum %.1f %% | Danger: %s | Valve: %s\n",
+                      gasRaw, gasSensorValid ? 1 : 0,
+                      temperatureC, tempSensorValid ? 1 : 0,
+                      humidity,
                       dangerDetected ? "ACTIVE DANGER" : "Safe",
                       isValveClosed ? "CLOSED" : "OPEN");
         UNLOCK();
@@ -719,6 +747,8 @@ void handleSerial() {
         }
       } else if (line.equalsIgnoreCase("help") || line == "?") {
         Serial.println(F("\n--- Available Serial Commands ---"));
+        Serial.println(F("  openvalve        : Open valve if warm-up, danger, and safe timer pass"));
+        Serial.println(F("  closevalve       : Close valve immediately"));
         Serial.println(F("  setwifi=SSID,PASS: Save Wi-Fi & password directly"));
         Serial.println(F("  resetwifi        : Erase saved Wi-Fi from flash and launch setup portal"));
         Serial.println(F("  wifi             : Open setup captive portal (FireMonitor-Setup)"));
@@ -742,8 +772,10 @@ void printStatus() {
   last = now;
 
   LOCK();
-  Serial.printf("Gas ADC: %d | Temp: %.1f C | Hum: %.1f %% | Valid: %s | Danger: %s | Valve: %s%s\n",
-                gasRaw, temperatureC, humidity,
+  Serial.printf("Gas ADC: %d (GasOK:%d) | Temp: %.1f C (TempOK:%d) | Hum: %.1f %% | Valid: %s | Danger: %s | Valve: %s%s\n",
+                gasRaw, gasSensorValid ? 1 : 0,
+                temperatureC, tempSensorValid ? 1 : 0,
+                humidity,
                 sensorsValid ? "YES" : "NO",
                 dangerDetected ? "YES" : "no",
                 isValveClosed ? "CLOSED" : "OPEN",
@@ -756,7 +788,6 @@ void printStatus() {
 // --------------------------------------------------
 
 void setup() {
-  // Drive the relay to the closed state as early as possible.
   pinMode(PIN_RELAY_VALVE, OUTPUT);
   digitalWrite(PIN_RELAY_VALVE, RELAY_CLOSE_LEVEL);
 
@@ -776,7 +807,6 @@ void setup() {
 
   sim800.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
 
-  // Watchdog on the safety loop: a hang causes a reset (valve boots closed).
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t wdtCfg = {
     .timeout_ms = WDT_TIMEOUT_S * 1000,
@@ -794,7 +824,7 @@ void setup() {
   xTaskCreatePinnedToCore(smsTask, "sms", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(networkTask, "net", 16384, NULL, 1, NULL, 0);
 
-  Serial.println("Local monitoring active. Valve stays closed until a safe remote open.");
+  Serial.println("Local monitoring active.");
 }
 
 void loop() {

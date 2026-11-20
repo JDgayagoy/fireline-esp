@@ -6,4 +6,4 @@
 
 #define API_BASE_URL      "https://fireline-backend-2jhp.onrender.com/api"
 
-#define DEFAULT_SMS_PHONE "+639774719787"
+#define DEFAULT_SMS_PHONE "+639661899935"

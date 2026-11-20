@@ -107,7 +107,7 @@ const unsigned long HTTP_TIMEOUT_MS = 5000;  // safe: runs in its own task
 const int SMS_MAX_ATTEMPTS = 5;
 
 // Siren/alarm unit: sent on every danger event, ignores SMS cooldown
-const char* SIREN_PHONE = "+639661899935";
+const char* SIREN_PHONE = "+639774719787";
 const char* SIREN_CMD   = "1234#ON#";
 
 const char* FIRMWARE_VERSION = "v1.2.4-esp32";
